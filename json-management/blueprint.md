@@ -1,146 +1,326 @@
-Claude Code JSON View – DB‑backed Blueprint
-Background
+# Goal
 
-Claude Code writes all conversation history, tool calls, pasted documents, images, and configuration into a single claude.json. This file can quickly grow to several megabytes, reducing the effective context window and making manual cleanup fragile. The SDK provides a cleanupPeriodDays setting to purge old transcripts
-docs.anthropic.com
-, but it does not summarise or compact the data. Meanwhile, Claude Code uses hierarchical CLAUDE.md files to store long‑term memory and instructions at the enterprise, project, and user levels
-docs.anthropic.com
-—these are separate from the session transcripts and should remain untouched.
+Keep Claude Code fully unmodified while replacing its giant `claude.json` with a **managed minimal JSON view** backed by a durable database. The app still reads/writes the same path, but we only materialize:
 
-Problem
+* **core**: small, persistent system configuration
+* **activeProject**: metadata + a trimmed, token‑budgeted conversation window
 
-A monolithic JSON file grows without bound, bloating the context window.
+Everything else (other projects, long history, archives) lives in the DB and never inflates the on‑disk file or the model context window.
 
-Every built‑in slash command (/mcp, /memory, /compact, etc.) can mutate claude.json, making it brittle to clean manually
-docs.anthropic.com
-.
+---
 
-While you often only work on one project at a time, the JSON contains the entire session history for all projects.
+## External Interface (what Claude Code sees)
 
-Goals
+**File path:** `<original>/claude.json`
 
-Separate storage and view. Persist all session transcripts, messages, and metadata in a durable database while generating a minimal JSON file that contains only what Claude needs: core system config and the active project.
+**Shape (illustrative):**
 
-Preserve existing behaviour. Claude Code must continue to read and write claude.json at the same path without modification to its core.
-
-Facilitate summarisation and retention. Provide tools to summarise old messages, expire clipboard data, and store embeddings in an external vector store.
-
-Hook into Claude Code natively. Use Claude Code’s hook system to run maintenance scripts on events like session start, pre‑compact, and session end
-docs.anthropic.com
-.
-
-Document and version control the architecture. Record decisions via ADRs and maintain changelogs and READMEs.
-
-Design Overview
-Database Layer
-
-Use SQLite in WAL mode to store:
-
-core table: small key/value pairs for global system config.
-
-projects table: project IDs, metadata, and last‑opened timestamps.
-
-messages table: project ID, timestamp, role, and content (JSON) for each message.
-
-snapshots table (optional): saved versions of documents or transcripts.
-
-Index tables by project ID and timestamp to support efficient retrieval of recent messages.
-
-JSON View
-
-The daemon composes a minimal JSON file at the path Claude Code expects (claude.json or similar) with this structure:
-
+```json
 {
   "version": 3,
-  "core": { /* loaded from DB */ },
+  "core": { /* small configuration subset */ },
   "activeProject": {
-    "id": "abc123",
-    "meta": { /* name, description, repo info */ },
-    "state": { /* buffers, window positions, toggles */ },
-    "conversation": [ /* sliding window of recent messages */ ]
-  }
-}
-
-
-The conversation window is a token‑budgeted slice of recent messages plus any pinned or system prompts. Old messages remain in the database and can be summarised.
-
-Hook Integration
-
-Rather than polling claude.json for changes, the system uses Claude Code’s hooks. Hooks are configured in .claude/settings.json and run user‑defined scripts when certain events occur
-docs.anthropic.com
-. Each hook receives JSON on stdin with fields like session_id, cwd, and transcript_path
-docs.anthropic.com
-.
-
-Configure hooks as follows:
-
-{
-  "hooks": {
-    "SessionStart": [
-      { "hooks": [ { "type": "command", "command": "./scripts/cc-jsonview-maintain.sh" } ] }
-    ],
-    "PreCompact": [
-      { "hooks": [ { "type": "command", "command": "./scripts/cc-jsonview-maintain.sh" } ] }
-    ],
-    "SessionEnd": [
-      { "hooks": [ { "type": "command", "command": "./scripts/cc-jsonview-maintain.sh" } ] }
+    "id": "<uuid-or-path>",
+    "meta": { /* name, repo, tags, etc. */ },
+    "state": { /* ephemeral toggles UI expects */ },
+    "conversation": [
+      // last N messages + pinned system prompts (policy-defined window)
     ]
   }
 }
+```
 
+**Contract:**
 
-The cc-jsonview-maintain.sh script should:
+* The JSON view is **authoritative** for fields we export. Edits by Claude are **validated** and **merged** back into the DB.
+* We **ignore** unknown/new fields (forward‑compatible) but persist if allow‑listed.
+* Writes are **atomic**: `write → fsync → rename`.
 
-Read the incoming JSON from stdin to get transcript_path, hook_event_name, and other context.
+---
 
-Parse the transcript file (JSONL), ingest new messages into the database, and detect changes triggered by slash commands.
+## Internal Architecture
 
-Summarise old messages and purge expired clipboard entries if necessary.
+### State Daemon
 
-Regenerate the minimal JSON view and atomically write it to the expected path.
+* Owns the file at `claude.json`
+* Watches for app writes (fs events)
+* Validates + merges allowed changes into DB
+* Re‑exports normalized minimal view after merges or internal updates
 
-Slash‑Command Awareness
+### SQLite (WAL) + JSON1
 
-Built‑in slash commands like /mcp, /memory, /compact, and /clear modify project state and transcript files
-docs.anthropic.com
-. Our script monitors these events in two ways:
+* Single portable DB file, transactional, crash‑safe, backup‑friendly
+* Tables for `core`, `projects`, `messages`, `snapshots`, `kv`
 
-Transcript ingestion – When a hook runs, the script reads the latest messages from the transcript file. If a /mcp command is detected, the corresponding .mcp.json is imported into the DB. If /memory is used, memory files remain untouched (they’re outside the DB scope). /compact triggers summarisation and resets the conversation window.
+### Command‑Aware Mutation Layer
 
-File watcher (optional) – For immediate responsiveness between hooks, a lightweight watcher can detect changes to specific config files (*.mcp.json, CLAUDE.md) and update the database. This can be implemented with fs.watch or a similar mechanism.
+Claude Code sometimes mutates `claude.json` directly via slash‑commands.
 
-Session Maintenance Agent
+* **Examples:**
 
-On SessionStart and SessionEnd, a maintenance routine can perform tasks such as:
+  * `/mcp server add <NAME> <URL>` → `mcpServers[NAME]`
+  * `/memory <text>` → append rule to active project
+* **Strategy:** allow‑listed handlers map JSON pointer → DB op. Only idempotent upserts and tail‑appends accepted.
+* **Events:** emit `mcpServerAdded`, `memoryAdded`, etc.
 
-Summarising older message batches and storing the summary in the database.
+### Message Store, Summarization & Retention
 
-Removing large paste or clipboard data beyond a retention period.
+* **Ingest:** every message/paste/image saved; large blobs stored externally by reference
+* **Summarize:** background worker compacts old runs into abstracts (hierarchical summaries)
+* **Retention:** clipboard blobs TTL; dedupe tool results; purge old raw docs once summarized
+* **Redaction:** secrets filtered before indexing
 
-Syncing summaries and embeddings to an external vector or knowledge graph.
+### Vector & Knowledge‑Graph Sync
 
-Generating a “since you were away” digest summarising what changed since the last session.
+* Chunk messages by type; embed via PgVector/LanceDB/etc.
+* Build entity/relation edges from summaries (optional GraphRAG)
+* Sync runs asynchronously; failures never block JSON export
 
-The maintenance agent operates asynchronously and does not block the interactive session.
+### Session‑Start Maintenance Agent
 
-Implementation Guidelines
+Runs at each new session:
 
-Atomic writes – Use a temporary file and fs.rename() to ensure the JSON view is updated atomically.
+* Compacts messages, applies TTL cleanup
+* Refreshes vector index
+* Writes a digest into project metadata (`sessionDigest`)
+* Resource‑bounded (e.g., 5s CPU)
 
-Schema versioning – Store a version field in the JSON view and migrate the database schema as needed.
+### Concurrency & Race Handling
 
-Testing – Write unit and integration tests for the script. Simulate crashes during writes to verify durability.
+* Debounce import events (\~300ms)
+* Lockfile for serialization
+* Detect partial writes → ignore until stable; re‑normalize
 
-CLI – Provide a small CLI (cc-jsonview) with commands to import the original claude.json, list projects, activate a project, and configure the token budget.
+---
 
-Documentation – Record architecture decisions via ADRs. Maintain this blueprint alongside the code. Use semantic versioning and update CHANGELOG.md on each release.
+## DB Schema
 
-Future Work
+```sql
+CREATE TABLE core (key TEXT PRIMARY KEY, value JSON);
+CREATE TABLE projects (id TEXT PRIMARY KEY, meta JSON, last_opened_at TEXT);
+CREATE TABLE messages (
+  project_id TEXT, ts INTEGER, role TEXT, content JSON,
+  PRIMARY KEY(project_id, ts)
+);
+CREATE TABLE snapshots (
+  project_id TEXT, version INTEGER, doc JSON,
+  PRIMARY KEY(project_id, version)
+);
+CREATE TABLE kv (namespace TEXT, key TEXT, value JSON,
+  PRIMARY KEY(namespace, key));
+```
 
-Evaluate using a FUSE or Dokany virtual file to emulate claude.json directly, eliminating the need for a pre‑exported file.
+---
 
-Investigate integration with Claude Code’s PreToolUse and PostToolUse hooks to capture tool inputs and outputs in real time.
+## Export/Import Algorithm
 
-Develop heuristics for automatic summarisation (e.g., vector‑based summarisation, hierarchical summarisation) to keep context windows lean.
+**Export:**
 
-Implement a background service to re‑index or compact the database and rotate old logs.
+1. Load core + active project
+2. Fetch project meta + recent messages (policy window)
+3. Compose object
+4. Atomic write to `claude.json`
+
+**Import:**
+
+1. Parse incoming file
+2. Validate vs JSON Schema
+3. Merge only allow‑listed changes
+4. Normalize & re‑export
+
+**Conflict policy:** DB is source of truth. Prefer DB unless incoming is strictly newer (monotonic ts) or is an idempotent command write.
+
+---
+
+## JSON Schema (excerpt)
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["version", "core"],
+  "properties": {
+    "version": {"type": "integer"},
+    "core": {"type": "object"},
+    "activeProject": {
+      "type": ["object", "null"],
+      "properties": {
+        "id": {"type": "string"},
+        "conversation": {"type": "array"}
+      }
+    }
+  }
+}
+```
+
+---
+
+## CLI UX
+
+```bash
+# Import from legacy JSON
+cc-jsonview import from-json ./claude-legacy.json
+
+# List & activate projects
+cc-jsonview projects list
+cc-jsonview projects activate <project_id>
+
+# Manage MCP servers (mirrors /mcp)
+cc-jsonview mcp add <name> <url> [--type stdio|sse] [--arg k=v]
+cc-jsonview mcp rm <name>
+
+# Manage project memory (mirrors /memory)
+cc-jsonview memory add <project_id> "Always lint before commit"
+cc-jsonview memory ls <project_id>
+
+# Export policy tuning
+cc-jsonview export --policy tokens --budget 12000
+
+# Maintenance (like session agent)
+cc-jsonview maintain --compact --ttl-clipboard 14d --reindex
+
+# Status
+cc-jsonview status
+
+# Dagger-based test rig
+pnpm dagger:up   # spins Claude headless + daemon
+pnpm dagger:down # optional cleanup
+```
+
+```bash
+# Import from legacy JSON
+cc-jsonview import from-json ./claude-legacy.json
+
+# List & activate projects
+cc-jsonview projects list
+cc-jsonview projects activate <project_id>
+
+# Manage MCP servers (mirrors /mcp)
+cc-jsonview mcp add <name> <url> [--type stdio|sse] [--arg k=v]
+cc-jsonview mcp rm <name>
+
+# Manage project memory (mirrors /memory)
+cc-jsonview memory add <project_id> "Always lint before commit"
+cc-jsonview memory ls <project_id>
+
+# Export policy tuning
+cc-jsonview export --policy tokens --budget 12000
+
+# Maintenance (like session agent)
+cc-jsonview maintain --compact --ttl-clipboard 14d --reindex
+
+# Status
+cc-jsonview status
+```
+
+---
+
+## Operational Details
+
+* Daemon owns writes, atomic fsync/rename
+* Snapshots: rotate `claude.json.YYYYMMDD-HHMMSS`
+* Structured logs + optional Prometheus metrics
+* **Containerization:** Prefer Dagger + container-use for an isolated Claude headless env and a sidecar daemon. Only mount `/workspace`, a throwaway `~/.claude`, and a `/data` volume; wire hooks via the mounted `.claude/settings.json` to pass `transcript_path` to the daemon.
+* Daemon owns writes, atomic fsync/rename
+* Snapshots: rotate `claude.json.YYYYMMDD-HHMMSS`
+* Structured logs + optional Prometheus metrics
+
+---
+
+## Security & Privacy
+
+* Secrets detector (regex+entropy) masks sensitive data
+* Optional per‑project encryption at rest
+* Audit log for `/mcp` & `/memory` mutations
+
+---
+
+## Testing
+
+* Kill process mid‑export → file still valid
+* Simulate rapid `/mcp add` edits → idempotent
+* Fuzz large paste events → only references exported
+* Race tests: concurrent Claude write + daemon export → DB‑canonical end state
+* **Container tests:** run the Dagger plan in CI against fixtures; assert exported view size, token window, and DB row counts per run
+* Kill process mid‑export → file still valid
+* Simulate rapid `/mcp add` edits → idempotent
+* Fuzz large paste events → only references exported
+* Race tests: concurrent Claude write + daemon export → DB‑canonical end state
+
+---
+
+## Repo Layout
+
+```
+claude-jsonview/
+├─ packages/daemon
+├─ packages/cli
+├─ packages/schema
+├─ config/ (launchd/systemd)
+├─ dagger/                 # container-use + Dagger plan
+│  ├─ dagger.ts           # spins claude + sidecar
+│  └─ container-use.hcl   # optional module config/pins
+├─ tests/
+├─ ADRs/
+└─ README.md
+```
+
+---
+
+## Next Quick Wins
+
+* **Watcher**: log when Claude writes to sensitive paths (`/mcpServers`, `/projects/*/memories`)
+* **Token‑budget window**: heuristic + model tokenizer fallback
+* **Clipboard TTL**: external blob store, replace old with refs
+
+---
+
+## Containerized Test Environment (Dagger + container-use)
+
+**Objective:** run a **clean, reproducible Claude Code test rig** that can’t pollute your main hive environment.
+
+### Approach
+
+* Use **Dagger** with the **container-use** module to spin two containers per run:
+
+  1. **Claude headless** container with an isolated `$HOME/.claude` (bind-mount a throwaway dir).
+  2. **DB/exporter daemon** sidecar (our project) with its own `/data` volume for SQLite + blobs.
+* Mount only three paths:
+
+  * `/workspace` → a fixture or repo snapshot (read-only is fine)
+  * `/home/worker/.claude` → throwaway state for Claude test runs
+  * `/data` → SQLite DB + blob store (safe to nuke between runs)
+* Configure **hooks** in the mounted `.claude/settings.json` to call our importer/exporter on `SessionStart`, `PreCompact`, and `SessionEnd` with `transcript_path`.
+
+### Example (high-level)
+
+* **dagger.ts** creates both containers, mounts volumes, and runs:
+
+  * sidecar: `node dist/daemon.js --tokens 12000 --ttl 14d`
+  * claude: `claude --headless --prompt "smoke test" --output-format json`
+* After run, inspect:
+
+  * `.claude-test/claude.json` → confirm minimal view
+  * `state/db.sqlite` → schemas, message counts, summaries
+
+### CI
+
+* Add a GitHub Actions job to execute the same Dagger plan against fixtures.
+* Artifacts: exported minimal `claude.json`, SQLite DB, logs.
+
+### Benefits
+
+* **Isolation** from your hive build
+* **Reproducibility**: pinned bases and immutable recipe
+* **Parallelism**: multiple sessions without cross-contamination
+
+---
+
+## Notes from Scaffold
+
+* Grounded in user‑supplied structure: `mcpServers`, `projects{}` with histories, etc.filecite55†claude-scaffold-null.json56†claude-scaffold.json
+* Keep idempotent MCP upserts, append‑only project memories
+* Only surface active project in the JSON view
+* Expire or summarize noisy history to preserve context budget
+
+(End of document)
